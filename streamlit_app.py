@@ -1,10 +1,12 @@
 import io
+from datetime import datetime, timezone
+import requests
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title='GoldPilot AI v1', page_icon='🥇', layout='wide')
-st.title('🥇 GoldPilot AI — v1')
-st.warning('ANALYSIS ONLY • No live MT5 connection • No automatic orders. Uploaded data may be delayed.')
+st.set_page_config(page_title='GoldPilot AI v2', page_icon='🥇', layout='wide')
+st.title('🥇 GoldPilot AI — v2')
+st.warning('ANALYSIS ONLY • External XAU/USD data, NOT MT5 quotes • No automatic orders. Check timestamps and provider access.')
 
 with st.sidebar:
     st.header('Risk settings')
@@ -24,7 +26,88 @@ c1.metric('Sizing balance', f'£{balance:,.2f}')
 c2.metric('Planned risk / trade', f'£{risk_budget:,.2f}')
 c3.metric('Daily loss threshold', f'£{daily_limit:,.2f}')
 
-tab1,tab2,tab3 = st.tabs(['Trade planner', 'CSV analysis', 'Risk guard'])
+tab0,tab1,tab2,tab3 = st.tabs(['Market monitor', 'Trade planner', 'CSV analysis', 'Risk guard'])
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_candles(key, interval, outputsize=260):
+    response = requests.get('https://api.twelvedata.com/time_series', params={
+        'symbol':'XAU/USD', 'interval':interval, 'outputsize':outputsize,
+        'timezone':'UTC', 'apikey':key}, timeout=15)
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get('status') == 'error' or not payload.get('values'):
+        raise ValueError(payload.get('message','No candles returned; check API plan, symbol and credits.'))
+    frame = pd.DataFrame(payload['values'])
+    frame['time'] = pd.to_datetime(frame['datetime'], utc=True, errors='coerce')
+    for col in ['open','high','low','close']:
+        frame[col] = pd.to_numeric(frame[col], errors='coerce')
+    frame = frame.dropna(subset=['time','open','high','low','close']).sort_values('time').drop_duplicates('time')
+    frame = frame[(frame.high >= frame[['open','close','low']].max(axis=1)) &
+                  (frame.low <= frame[['open','close','high']].min(axis=1))]
+    return frame, payload.get('meta',{})
+
+def analyse(frame):
+    df = frame.copy()
+    for span in (20,50,200):
+        df[f'ema{span}'] = df.close.ewm(span=span,adjust=False).mean()
+    change = df.close.diff()
+    up = change.clip(lower=0).ewm(alpha=1/14,adjust=False,min_periods=14).mean()
+    down = (-change.clip(upper=0)).ewm(alpha=1/14,adjust=False,min_periods=14).mean()
+    df['rsi'] = 100-100/(1+up/down.replace(0,float('nan')))
+    previous = df.close.shift(1)
+    tr = pd.concat([df.high-df.low,(df.high-previous).abs(),(df.low-previous).abs()],axis=1).max(axis=1)
+    df['atr'] = tr.ewm(alpha=1/14,adjust=False,min_periods=14).mean()
+    last = df.iloc[-1]
+    bias = ('BULLISH' if last.close > last.ema20 > last.ema50 > last.ema200 else
+            'BEARISH' if last.close < last.ema20 < last.ema50 < last.ema200 else 'MIXED / WAIT')
+    return df,last,bias
+
+with tab0:
+    st.subheader('XAU/USD market monitor — Twelve Data')
+    st.caption('External aggregated candles, not MetaQuotes bid/ask or executable MT5 prices. Refresh occurs only while this page is open or when you request it.')
+    try:
+        api_key = st.secrets.get('TWELVEDATA_API_KEY','')
+    except (FileNotFoundError, KeyError):
+        api_key = ''
+    if not api_key:
+        st.error('API key not configured. Add TWELVEDATA_API_KEY in Streamlit app Settings → Secrets. Do not put it in GitHub.')
+    else:
+        interval = st.selectbox('Timeframe', ['5min','15min','1h','4h','1day'], index=1)
+        if st.button('Fetch latest candles'):
+            fetch_candles.clear()
+        try:
+            raw,meta = fetch_candles(api_key,interval)
+            if len(raw)<205:
+                st.warning(f'Only {len(raw)} candles available; at least 205 needed for EMA200 analysis.')
+            else:
+                # API timestamps represent candle opens; exclude latest potentially forming candle.
+                closed = raw.iloc[:-1].copy()
+                analysed,last,bias = analyse(closed)
+                interval_minutes={'5min':5,'15min':15,'1h':60,'4h':240,'1day':1440}[interval]
+                age = (datetime.now(timezone.utc)-last.time.to_pydatetime()).total_seconds()/60
+                stale = age < 0 or age > interval_minutes*3+10
+                st.caption('Source: Twelve Data | Provider symbol: '+str(meta.get('symbol','XAU/USD'))+' | Last analysed candle opened (UTC): '+str(last.time))
+                st.caption('Newest API candle deliberately excluded because it may still be forming. This conservative rule can lag by one candle.')
+                if stale: st.error('STALE / INVALID TIMESTAMP — no actionable setup. Check market hours, provider data and clock.')
+                a,b,c=st.columns(3)
+                a.metric('Last closed candle',f'${last.close:,.2f}')
+                b.metric('EMA alignment',bias)
+                c.metric('RSI(14)',f'{last.rsi:.1f}' if pd.notna(last.rsi) else 'N/A')
+                st.line_chart(analysed.set_index('time')[['close','ema20','ema50','ema200']].tail(120))
+                st.caption('ATR(14): '+(f'${last.atr:.2f}' if pd.notna(last.atr) else 'N/A'))
+                if stale or pd.isna(last.atr) or last.atr<=0 or bias=='MIXED / WAIT':
+                    st.info('WAIT — insufficient or mixed conditions. No trade scenario.')
+                else:
+                    side='BUY' if bias=='BULLISH' else 'SELL'
+                    entry=float(last.close)
+                    stop=entry-1.5*float(last.atr) if side=='BUY' else entry+1.5*float(last.atr)
+                    target=entry+min_rr*abs(entry-stop) if side=='BUY' else entry-min_rr*abs(entry-stop)
+                    st.info(f'ILLUSTRATIVE {side} SCENARIO (not an entry signal): entry ${entry:.2f}, SL ${stop:.2f}, TP ${target:.2f}, target R:R 1:{min_rr:g} before costs. Levels are mechanically derived from ATR, not validated support/resistance.')
+                    st.warning('Do not execute this scenario. Check current MT5 bid/ask, spread, broker specifications, news and whether the target is realistic. No model probability or backtest is claimed.')
+        except (requests.RequestException,ValueError,KeyError,TypeError) as exc:
+            st.error('Market data unavailable: '+str(exc))
+            st.info('No fallback price is invented. Check your key, subscription, symbol availability and API credits.')
+
 with tab1:
     st.subheader('Manual trade planner')
     st.caption('Enter prices from your own MT5 chart. This is a calculator, not a signal.')
@@ -99,4 +182,4 @@ with tab3:
     st.caption('Manual values reset when the session resets. This is not an enforced broker-side kill switch.')
 
 st.divider()
-st.caption('GoldPilot AI v1 • Educational demo dashboard • No order execution, continuous monitoring, news feed or trained prediction model.')
+st.caption('GoldPilot AI v2 • External API on-demand monitoring • No continuous background worker, news feed, Telegram, trained prediction model or order execution.')
